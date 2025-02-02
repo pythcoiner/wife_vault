@@ -1,0 +1,9 @@
+[package]
+name = "limited_flow_covenant"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hex-conservative = { version = "0.3.0", features = ["serde"] }
+miniscript = {version = "12.3.0", features = ["serde", "rand", "compiler", "base64"]}
+serde = { version = "1.0.217", features =  ["derive"] }

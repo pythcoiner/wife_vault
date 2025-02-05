@@ -1,16 +1,20 @@
-mod cli;
-
-use std::{collections::BTreeMap, env, fs::File, io::Read, path::PathBuf, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{self, Read},
+    path::PathBuf,
+    str::FromStr,
+};
 
 use bip39::Mnemonic;
-use cli::Command;
-use lfc::{FEE, SECP};
+use lazy_static::lazy_static;
 use miniscript::{
     bitcoin::{
         absolute::{Height, LockTime},
         bip32::{ChildNumber, DerivationPath, Xpriv, Xpub},
         consensus,
         psbt::{Input, Output},
+        secp256k1::{self, All},
         transaction::Version,
         Address, Amount, Network, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
         Witness,
@@ -21,140 +25,54 @@ use miniscript::{
 };
 use serde::{Deserialize, Serialize};
 
-fn main() {
-    let args = cli::parse();
-    match &args.command {
-        Command::Status => todo!(),
-        Command::Conf => cli::conf(args),
-        Command::Create => todo!(),
-        Command::Unlock => todo!(),
-        Command::Lock => todo!(),
-        Command::Relock => todo!(),
-        Command::Del => cli::del_wallet(args),
-        Command::Sign => todo!(),
-        Command::Register {
-            height: _,
-            transaction: _,
-        } => {
-            eprintln!("{args:?}");
-        }
-        Command::Spend {
-            amount: _,
-            address: _,
-        } => {
-            eprintln!("{args:?}");
-        }
-    }
+lazy_static! {
+    pub static ref SECP: secp256k1::Secp256k1<All> = secp256k1::Secp256k1::new();
 }
 
-fn run() {
-    let args: Vec<String> = env::args().collect();
+pub const FEE: u64 = 600;
+pub const MAX_DERIV: u32 = (2u64.pow(31) - 1) as u32;
 
-    if args.len() < 2 {
-        println!(
-            "Path to config file must be passed as argument: \n{} <path>",
-            args[0]
-        );
-        std::process::exit(1);
-    }
-
-    let conf = match CovenantConfig::from_file(&args[1]) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("Fail to get configuration: {:?} ", e);
-            std::process::exit(1);
-        }
-    };
-    let conf_str = serde_json::to_string_pretty(&conf).unwrap();
-    println!("Configuration: \n {}", conf_str);
-    let covenant = Covenant::new(
-        conf.cov_xpub(0).unwrap(),
-        conf.spend_xpub(0).unwrap(),
-        conf.delay(),
-        Network::Regtest,
-    );
-
-    let funding_addr = covenant.cov_addr(0);
-
-    println!("Address to fund the contract: {}", funding_addr);
-
-    println!("Enter raw tx that fund the contract:");
-
-    let mut raw_tx = String::new();
-    std::io::stdin().read_line(&mut raw_tx).unwrap();
-    raw_tx = raw_tx.trim().into();
-
-    let tx0: Result<Transaction, _> = consensus::encode::deserialize_hex(&raw_tx);
-    let tx0 = match tx0 {
-        Ok(tx) => tx,
-        Err(e) => {
-            println!("Fail to parse transaction: \n {} \n {}", raw_tx, e);
-            std::process::exit(1);
-        }
-    };
-
-    if tx0.output[0].script_pubkey != funding_addr.script_pubkey() {
-        println!("The first output of the tx must fund the funding address!");
-        std::process::exit(1);
-    }
-
-    let amount = tx0.output[0].value.to_sat();
-
-    if amount == 0 {
-        println!("Amount of funding input must be > 0");
-        std::process::exit(1);
-    }
-
-    println!("Amount to split: {}", amount);
-
-    let mut txs = Vec::new();
-    let mut previous_tx = tx0;
-    let mut previous_amount = amount;
-    let mut index = 1;
-
-    loop {
-        let (spend, relock) = if previous_amount > conf.amount {
-            let mut relock = previous_amount.saturating_sub(conf.amount);
-            if relock <= FEE {
-                relock = 0;
-            }
-            let spend = if relock == 0 {
-                previous_amount.saturating_sub(FEE)
-            } else {
-                conf.amount
-            };
-            (spend, relock)
-        } else {
-            (previous_amount - FEE, 0)
-        };
-        let psbt = covenant.craft_tx(previous_tx.clone(), index, spend, relock);
-        previous_tx = psbt.unsigned_tx.clone();
-        previous_amount = previous_tx.output[0].value.to_sat();
-        index += 1;
-
-        txs.push(psbt);
-
-        if relock < (2 * FEE) {
-            break;
-        }
-    }
-
-    println!("{} unsigned psbts: \n", txs.len());
-
-    let mut i = 0;
-    for p in &txs {
-        i += 1;
-        println!("psbt {}: \n {} \n", i, p);
-    }
+pub fn parse_tx(raw_tx: &str) -> Result<Transaction, String> {
+    let tx: Result<Transaction, _> = consensus::encode::deserialize_hex(raw_tx);
+    tx.map_err(|e| e.to_string())
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct CovenantConfig {
-    cov_mnemonic: String,
-    spend_mnemonic: String,
-    amount: u64,
-    delay: u16,
-    index: u32,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Round {
+    // Psbt of this round, already signed
+    psbt: Psbt,
+    // The transaction that have unlocked this round
+    spend: Option<Transaction>,
+    // Spending txs (ancestors of `coins`)
+    transactions: Vec<Transaction>,
+    // Coins spendable by the spend key
+    coins: Vec<OutPoint>,
+    // Blockheight we must wait to unlock
+    unlock: Option<u64>,
+    // Blockheight of the block containing the unlock tx
+    unlocked: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CovenantState {
+    pub cov_mnemonic: String,
+    pub spend_mnemonic: String,
+    pub amount: u64,
+    pub delay: u16,
+    pub index: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rounds: Vec<Round>,
+}
+
+impl PartialEq for CovenantState {
+    fn eq(&self, other: &Self) -> bool {
+        self.cov_mnemonic == other.cov_mnemonic
+            && self.spend_mnemonic == other.spend_mnemonic
+            && self.amount == other.amount
+            && self.delay == other.delay
+            && self.index == other.index
+            && self.rounds.len() == other.rounds.len()
+    }
 }
 
 #[derive(Debug)]
@@ -168,9 +86,24 @@ pub enum Error {
     Mnemonic,
     Xpriv,
     DeriveXpriv,
+    DumpConfig,
+    IO(io::Error),
+    SerdeJson(serde_json::Error),
 }
 
-impl CovenantConfig {
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Self::IO(value)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Self::SerdeJson(value)
+    }
+}
+
+impl CovenantState {
     pub fn origin_path(&self) -> Vec<ChildNumber> {
         vec![84, 1, self.index]
             .into_iter()
@@ -192,6 +125,12 @@ impl CovenantConfig {
             .map_err(|_| Error::ReadConfig)?;
         let conf: Self = serde_json::from_str(&conf_str).map_err(|_| Error::ParseConfig)?;
         Ok(conf)
+    }
+
+    pub fn to_file(&self, path: PathBuf) -> Result<(), Error> {
+        let file = File::create(path)?;
+        serde_json::to_writer_pretty(file, self)?;
+        Ok(())
     }
 
     fn master_xpriv(mnemonic: &str) -> Result<Xpriv, Error> {
@@ -402,16 +341,17 @@ mod tests {
         let cov_mnemonic = Mnemonic::generate(12).unwrap().to_string();
         let spend_mnemonic = Mnemonic::generate(12).unwrap().to_string();
 
-        let conf = CovenantConfig {
+        let conf = CovenantState {
             cov_mnemonic,
             spend_mnemonic,
             amount: 10_000_000,
             delay: 4500,
             index: 0,
+            rounds: Vec::new(),
         };
 
         let conf_str = serde_json::to_string_pretty(&conf).unwrap();
-        let parsed: CovenantConfig = serde_json::from_str(&conf_str).unwrap();
+        let parsed: CovenantState = serde_json::from_str(&conf_str).unwrap();
         assert_eq!(conf, parsed);
     }
 }
